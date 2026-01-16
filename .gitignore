@@ -120,3 +120,6 @@ typedoc.json
 
 # tsx
 **/tsx-0
+
+# generated mockdata locales
+mockdata/src/locales/
