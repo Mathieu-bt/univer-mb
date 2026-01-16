@@ -1,0 +1,27 @@
+{
+  "name": "hello-univer",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@univerjs/core": "^0.15.1",
+    "@univerjs/design": "^0.15.1",
+    "@univerjs/docs": "^0.15.1",
+    "@univerjs/docs-ui": "^0.15.1",
+    "@univerjs/engine-formula": "^0.15.1",
+    "@univerjs/engine-render": "^0.15.1",
+    "@univerjs/mockdata": "^0.15.1",
+    "@univerjs/sheets": "^0.15.1",
+    "@univerjs/sheets-formula": "^0.15.1",
+    "@univerjs/sheets-numfmt": "^0.15.1",
+    "@univerjs/sheets-ui": "^0.15.1",
+    "@univerjs/ui": "^0.15.1",
+    "vite": "^7.3.1"
+  }
+}
