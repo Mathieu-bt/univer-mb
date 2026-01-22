@@ -435,6 +435,14 @@ export class FWorksheet extends FBaseInitialable {
     }
 
     /**
+     * Returns the current number of columns in the sheet.
+     * @returns {number} The column count of the sheet
+     */
+    getColumnCount(): number {
+        return this._worksheet.getColumnCount();
+    }
+
+    /**
      * Returns the current number of rows in the sheet, regardless of content.
      * @returns {number}The maximum rows count of the sheet
      * @example
@@ -446,6 +454,14 @@ export class FWorksheet extends FBaseInitialable {
      */
     getMaxRows(): number {
         return this._worksheet.getMaxRows();
+    }
+
+    /**
+     * Returns the current number of rows in the sheet.
+     * @returns {number} The row count of the sheet
+     */
+    getRowCount(): number {
+        return this._worksheet.getRowCount();
     }
 
     /**

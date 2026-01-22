@@ -91,6 +91,10 @@ const define = {
     'process.env.IS_E2E': isE2E ? 'true' : 'false',
 };
 
+// Local dev convenience for the chat client: expose GOOGLE_API_KEY to the browser bundle.
+// NOTE: This embeds the key into the built JS. Only use for local development.
+define.__GOOGLE_API_KEY__ = JSON.stringify(process.env.GOOGLE_API_KEY ?? '');
+
 if (!args.watch) {
     const gitCommitHash = isE2E ? 'E2E' : execSync('git rev-parse --short HEAD').toString().trim();
     const gitRefName = isE2E ? 'E2E' : execSync('git symbolic-ref -q --short HEAD || git describe --tags --exact-match').toString().trim();

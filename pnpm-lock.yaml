@@ -483,6 +483,9 @@ importers:
       '@univerjs/action-recorder':
         specifier: workspace:*
         version: link:../packages/action-recorder
+      '@univerjs/chat-client':
+        specifier: workspace:*
+        version: link:../packages/chat-client
       '@univerjs/core':
         specifier: workspace:*
         version: link:../packages/core
@@ -767,6 +770,37 @@ importers:
       vitest:
         specifier: ^4.0.16
         version: 4.0.16(@types/node@25.0.3)(happy-dom@20.0.11)(jiti@2.6.1)(jsdom@27.0.1)(sass@1.87.0)(terser@5.44.1)(tsx@4.21.0)(yaml@2.8.2)
+
+  packages/chat-client:
+    dependencies:
+      '@univerjs/core':
+        specifier: workspace:*
+        version: link:../core
+      '@univerjs/design':
+        specifier: workspace:*
+        version: link:../design
+      '@univerjs/icons':
+        specifier: ^1.1.1
+        version: 1.1.1(react-dom@19.2.3(react@19.2.3))(react@19.2.3)
+      '@univerjs/ui':
+        specifier: workspace:*
+        version: link:../ui
+      '@univerjs/uniscript':
+        specifier: workspace:*
+        version: link:../uniscript
+      react:
+        specifier: 19.2.3
+        version: 19.2.3
+      rxjs:
+        specifier: '>=7.0.0'
+        version: 7.8.2
+    devDependencies:
+      '@univerjs-infra/shared':
+        specifier: workspace:*
+        version: link:../../common/shared
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
 
   packages/core:
     dependencies:

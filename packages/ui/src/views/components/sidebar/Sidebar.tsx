@@ -18,7 +18,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import type { ICustomLabelProps } from '../../../components/custom-label/CustomLabel';
 import { borderLeftBottomClassName, clsx, scrollbarClassName } from '@univerjs/design';
 import { CloseIcon } from '@univerjs/icons';
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CustomLabel } from '../../../components/custom-label/CustomLabel';
 import { ISidebarService } from '../../../services/sidebar/sidebar.service';
 import { useDependency, useObservable } from '../../../utils/di';
@@ -42,6 +42,10 @@ export function Sidebar() {
     const sidebarService = useDependency(ISidebarService);
     const sidebarOptions = useObservable<ISidebarMethodOptions>(sidebarService.sidebarOptions$);
     const scrollRef = useRef<HTMLDivElement>(null);
+
+    // Resize state
+    const [dragWidth, setDragWidth] = useState<number | null>(null);
+    const sidebarRef = useRef<HTMLElement>(null);
 
     const options = useMemo(() => {
         if (!sidebarOptions) {
@@ -92,15 +96,50 @@ export function Sidebar() {
         };
     }, [sidebarService]);
 
+    // Reset drag width when closing or opening new sidebar
+    useEffect(() => {
+        if (!options?.visible) {
+            setDragWidth(null);
+        }
+    }, [options?.visible]);
+
     const width = useMemo(() => {
         if (!options?.visible) return 0;
+
+        if (dragWidth !== null) {
+            return `${dragWidth}px`;
+        }
 
         if (typeof options.width === 'number') {
             return `${options.width}px`;
         }
 
         return options.width;
-    }, [options]);
+    }, [options, dragWidth]);
+
+    const handleResizeStart = (e: React.MouseEvent) => {
+        e.preventDefault();
+        const startX = e.clientX;
+        const startWidth = sidebarRef.current?.offsetWidth || 0;
+
+        const handleMouseMove = (moveEvent: MouseEvent) => {
+            const deltaX = startX - moveEvent.clientX; // Moving left increases width
+            const newWidth = Math.max(200, Math.min(800, startWidth + deltaX)); // Min 200px, Max 800px
+            setDragWidth(newWidth);
+        };
+
+        const handleMouseUp = () => {
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        };
+
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+        document.body.style.cursor = 'ew-resize';
+        document.body.style.userSelect = 'none';
+    };
 
     function handleClose() {
         const options = {
@@ -114,6 +153,7 @@ export function Sidebar() {
     }
     return (
         <section
+            ref={sidebarRef}
             data-u-comp="sidebar"
             className={clsx(`
               univer-relative univer-h-full univer-bg-white univer-text-gray-900
@@ -124,6 +164,19 @@ export function Sidebar() {
             })}
             style={{ width }}
         >
+            {/* Resize Handle */}
+            {options?.visible && (
+                <div
+                    onMouseDown={handleResizeStart}
+                    className={`
+                      univer-absolute univer-left-0 univer-top-0 univer-z-50 univer-h-full univer-w-1
+                      univer-cursor-ew-resize univer-transition-colors univer-duration-200
+                      hover:univer-bg-blue-500
+                    `}
+                    style={{ transform: 'translateX(-50%)' }}
+                />
+            )}
+
             <section
                 ref={scrollRef}
                 className={clsx(`

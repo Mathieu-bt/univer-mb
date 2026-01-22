@@ -18,6 +18,7 @@
     "dependencies": {
         "@lit/react": "^1.0.8",
         "@univerjs/action-recorder": "workspace:*",
+        "@univerjs/chat-client": "workspace:*",
         "@univerjs/core": "workspace:*",
         "@univerjs/data-validation": "workspace:*",
         "@univerjs/debugger": "workspace:*",

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import { UniverChatClientPlugin } from '@univerjs/chat-client';
 import { LocaleType, LogLevel, Univer, UniverInstanceType } from '@univerjs/core';
 import { UniverDebuggerPlugin } from '@univerjs/debugger';
 import { UniverDocsPlugin } from '@univerjs/docs';
@@ -62,6 +63,7 @@ univer.registerPlugin(UniverSheetsNumfmtPlugin);
 univer.registerPlugin(UniverSheetsNumfmtUIPlugin);
 univer.registerPlugin(UniverFormulaEnginePlugin);
 univer.registerPlugin(UniverSheetsFormulaPlugin);
+univer.registerPlugin(UniverChatClientPlugin);
 univer.registerPlugin(UniverUniscriptPlugin, {
     getWorkerUrl(_: string, label: string) {
         if (label === 'typescript' || label === 'javascript') {
