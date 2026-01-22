@@ -21,6 +21,42 @@ import { BehaviorSubject } from 'rxjs';
 
 declare const __GOOGLE_API_KEY__: string | undefined;
 
+const SHEET_CONTEXT_MAX_SAMPLE_ROWS = 10;
+const SHEET_CONTEXT_MAX_SAMPLE_COLS = 8;
+const SHEET_CONTEXT_MAX_CHARS = 2400;
+const SHEET_CONTEXT_CACHE_TTL_MS = 1500;
+const MAX_AUTO_FIX_ATTEMPTS = 2;
+
+function columnIndexToA1(columnIndex: number): string {
+    let n = columnIndex + 1;
+    let s = '';
+    while (n > 0) {
+        const m = (n - 1) % 26;
+        s = String.fromCharCode(65 + m) + s;
+        n = Math.floor((n - 1) / 26);
+    }
+    return s;
+}
+
+function toA1(rowIndex: number, columnIndex: number): string {
+    return `${columnIndexToA1(columnIndex)}${rowIndex + 1}`;
+}
+
+function a1ToRowCol(a1: string): { row: number; col: number } | undefined {
+    const m = /^([A-Z]+)(\d+)$/.exec(a1.trim().toUpperCase());
+    if (!m) return;
+    const [, colLetters, rowStr] = m;
+    const row = Number(rowStr) - 1;
+    if (!Number.isFinite(row) || row < 0) return;
+    let col = 0;
+    for (const ch of colLetters) {
+        col = col * 26 + (ch.charCodeAt(0) - 64);
+    }
+    col -= 1;
+    if (col < 0) return;
+    return { row, col };
+}
+
 export interface IChatMessage {
     role: 'user' | 'model';
     content: string;
@@ -32,7 +68,7 @@ export interface ITraceLog {
     message: string;
 }
 
-interface GeminiContent {
+interface IGeminiContent {
     role: string;
     parts: { text: string }[];
 }
@@ -44,14 +80,22 @@ The code should be wrapped in a code block with the language 'javascript'.
 Available API:
 - univerAPI.getActiveWorkbook() - Get the active workbook
 - workbook.getActiveSheet() - Get the active sheet
-- sheet.getRange(row, col, numRows, numCols) - Get a range (0-indexed)
+- sheet.getRange(row, col, numRows, numCols) OR sheet.getRange('A1:B10') - Get a range
+- sheet.getDataRange() - Range that covers the used data region
 - range.setValue(value) - Set a single value
 - range.setValues([[values]]) - Set multiple values
 - range.getValues() - Get values from a range
+- range.clear({ contentsOnly?: boolean, formatOnly?: boolean }) - Clear range
 - range.setFontWeight('bold' | 'normal') - Set font weight
 - range.setBackground(color) - Set background color (e.g. '#ff0000')
 - range.setFontColor(color) - Set font color (e.g. '#000000')
-- sheet.getRowCount(), sheet.getMaxColumns() - Get dimensions
+- sheet.getRowCount(), sheet.getColumnCount() - Current grid size
+- sheet.getMaxRows(), sheet.getMaxColumns() - Max grid size
+
+PERFORMANCE RULES:
+- Do NOT build huge 2D arrays to clear a sheet. Use sheet.getDataRange().clear({ contentsOnly: true }) instead.
+- Prefer A1 notation for small edits (e.g. sheet.getRange('A2').setValue('hi')).
+- Only call range.getValues() for the specific range you need (avoid full-sheet reads).
 
 Example response for "Create a table with headers Name and Age":
 \`\`\`javascript
@@ -78,7 +122,10 @@ export class ChatService extends Disposable {
     private _apiKey: string = '';
     private _model: string = 'gemini-3-flash-preview';
     private _thinkingLevel: 'minimal' | 'low' | 'medium' | 'high' = 'high';
-    private _conversationHistory: GeminiContent[] = [];
+    private _conversationHistory: IGeminiContent[] = [];
+
+    private _sheetContextDirty = true;
+    private _sheetContextCache: { key: string; text: string; updatedAt: number } | undefined;
 
     constructor(
         @ILogService private readonly _logService: ILogService,
@@ -123,11 +170,15 @@ export class ChatService extends Disposable {
         this._logService.log('[ChatService Trace]', `[${type}]`, message);
     }
 
+    private _invalidateSheetContextCache(): void {
+        this._sheetContextDirty = true;
+    }
+
     /**
      * Get current sheet context for LLM awareness
      * Uses safe injector access to avoid circular dependencies
      */
-    private _getSheetContext(): string {
+    private _getSheetContext(force = false): string {
         try {
             const univerInstanceService = this._injector.get(IUniverInstanceService);
             const workbook = univerInstanceService.getCurrentUnitOfType<Workbook>(UniverInstanceType.UNIVER_SHEET);
@@ -140,67 +191,90 @@ export class ChatService extends Disposable {
                 return '[No active worksheet]';
             }
 
+            const workbookId = typeof (workbook as any).getUnitId === 'function' ? String((workbook as any).getUnitId()) : 'unknown-workbook';
+            const sheetId = typeof (worksheet as any).getSheetId === 'function' ? String((worksheet as any).getSheetId()) : 'unknown-sheet';
+            const cacheKey = `${workbookId}:${sheetId}`;
+
+            const now = Date.now();
+            if (
+                !force
+                && !this._sheetContextDirty
+                && this._sheetContextCache
+                && this._sheetContextCache.key === cacheKey
+                && now - this._sheetContextCache.updatedAt < SHEET_CONTEXT_CACHE_TTL_MS
+            ) {
+                return this._sheetContextCache.text;
+            }
+
             const sheetName = worksheet.getName();
             const cellMatrix = worksheet.getCellMatrix();
-            const maxRows = Math.min(worksheet.getRowCount(), 20); // Limit to 20 rows
-            const maxCols = Math.min(worksheet.getColumnCount(), 10); // Limit to 10 cols
+            const rangeProvider = worksheet as unknown as {
+                getDataRealRange?: () => { startRow: number; endRow: number; startColumn: number; endColumn: number };
+                getRowCount: () => number;
+                getColumnCount: () => number;
+            };
 
-            // Find actual used range
-            let lastRow = 0;
-            let lastCol = 0;
-            for (let r = 0; r < maxRows; r++) {
-                for (let c = 0; c < maxCols; c++) {
-                    const cell = cellMatrix.getValue(r, c);
-                    if (cell && (cell.v !== undefined && cell.v !== null && cell.v !== '')) {
-                        lastRow = Math.max(lastRow, r);
-                        lastCol = Math.max(lastCol, c);
-                    }
-                }
-            }
-
-            if (lastRow === 0 && lastCol === 0) {
+            const realRange = rangeProvider.getDataRealRange?.();
+            const isEmpty = !realRange || (realRange.endRow < realRange.startRow) || (realRange.endColumn < realRange.startColumn);
+            if (isEmpty) {
                 const firstCell = cellMatrix.getValue(0, 0);
                 if (!firstCell || firstCell.v === undefined || firstCell.v === null || firstCell.v === '') {
-                    return `[Sheet: ${sheetName}] - Empty sheet`;
+                    const text = `[Sheet: ${sheetName}] - Empty sheet`;
+                    this._sheetContextCache = { key: cacheKey, text, updatedAt: now };
+                    this._sheetContextDirty = false;
+                    return text;
                 }
             }
 
-            // Build markdown table
-            const colLetters = 'ABCDEFGHIJ'.split('');
-            let table = `[Sheet: ${sheetName}]\n`;
-            table += `Used range: A1:${colLetters[lastCol]}${lastRow + 1}\n\n`;
+            const usedStartRow = realRange ? realRange.startRow : 0;
+            const usedStartCol = realRange ? realRange.startColumn : 0;
+            const usedEndRow = realRange ? realRange.endRow : Math.max(0, rangeProvider.getRowCount() - 1);
+            const usedEndCol = realRange ? realRange.endColumn : Math.max(0, rangeProvider.getColumnCount() - 1);
 
-            // Header row
-            table += '| Row |';
-            for (let c = 0; c <= lastCol; c++) {
-                table += ` ${colLetters[c]} |`;
-            }
-            table += '\n|-----|';
-            for (let c = 0; c <= lastCol; c++) {
-                table += '------|';
-            }
-            table += '\n';
+            const sampleEndRow = Math.min(usedEndRow, usedStartRow + SHEET_CONTEXT_MAX_SAMPLE_ROWS - 1);
+            const sampleEndCol = Math.min(usedEndCol, usedStartCol + SHEET_CONTEXT_MAX_SAMPLE_COLS - 1);
 
-            // Data rows
-            for (let r = 0; r <= Math.min(lastRow, 15); r++) { // Cap at 15 rows for context
-                table += `| ${r + 1} |`;
-                for (let c = 0; c <= lastCol; c++) {
+            let text = `[Sheet: ${sheetName}]\n`;
+            text += `Used range: ${toA1(usedStartRow, usedStartCol)}:${toA1(usedEndRow, usedEndCol)}\n\n`;
+
+            text += '| Row |';
+            for (let c = usedStartCol; c <= sampleEndCol; c++) {
+                text += ` ${columnIndexToA1(c)} |`;
+            }
+            text += '\n|-----|';
+            for (let c = usedStartCol; c <= sampleEndCol; c++) {
+                text += '------|';
+            }
+            text += '\n';
+
+            for (let r = usedStartRow; r <= sampleEndRow; r++) {
+                text += `| ${r + 1} |`;
+                for (let c = usedStartCol; c <= sampleEndCol; c++) {
                     const cell = cellMatrix.getValue(r, c);
                     let value = '';
                     if (cell && cell.v !== undefined && cell.v !== null) {
-                        value = String(cell.v).substring(0, 20); // Truncate long values
-                        if (String(cell.v).length > 20) value += '...';
+                        value = String(cell.v).replaceAll('\n', ' ').substring(0, 30);
+                        if (String(cell.v).length > 30) value += '...';
                     }
-                    table += ` ${value} |`;
+                    text += ` ${value} |`;
                 }
-                table += '\n';
+                text += '\n';
+                if (text.length > SHEET_CONTEXT_MAX_CHARS) {
+                    text += '\n... (context truncated)';
+                    break;
+                }
             }
 
-            if (lastRow > 15) {
-                table += `\n... (${lastRow - 15} more rows not shown)`;
+            if (usedEndRow > sampleEndRow) {
+                text += `\n... (${usedEndRow - sampleEndRow} more rows not shown)`;
+            }
+            if (usedEndCol > sampleEndCol) {
+                text += `\n... (${usedEndCol - sampleEndCol} more columns not shown)`;
             }
 
-            return table;
+            this._sheetContextCache = { key: cacheKey, text, updatedAt: now };
+            this._sheetContextDirty = false;
+            return text;
         } catch (error) {
             this._logService.error('[ChatService]', 'Error getting sheet context:', error);
             return '[Error reading sheet data]';
@@ -264,7 +338,7 @@ export class ChatService extends Disposable {
 
             // Execute code if present
             if (codeMatch) {
-                await this._executeCodeFromResponse(codeMatch[1].trim());
+                await this._executeWithAutoFix(codeMatch[1].trim(), text);
             } else {
                 this._addTrace('info', 'No code block found to execute.');
             }
@@ -279,20 +353,27 @@ export class ChatService extends Disposable {
     }
 
     private async _callGeminiAPI(): Promise<{ text: string; thoughts?: string }> {
+        return this._callGeminiAPIWithContents(this._conversationHistory, this._thinkingLevel);
+    }
+
+    private async _callGeminiAPIWithContents(
+        contents: IGeminiContent[],
+        thinkingLevel: 'minimal' | 'low' | 'medium' | 'high'
+    ): Promise<{ text: string; thoughts?: string }> {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${this._model}:generateContent?key=${this._apiKey}`;
 
-        const body: any = {
+        const body: Record<string, any> = {
             system_instruction: {
                 parts: [{ text: SYSTEM_INSTRUCTION }],
             },
-            contents: this._conversationHistory,
+            contents,
             generationConfig: {},
         };
 
         // Add thinking level for Gemini 3
         if (this._model.startsWith('gemini-3')) {
             body.generationConfig.thinkingConfig = {
-                thinkingLevel: this._thinkingLevel,
+                thinkingLevel,
             };
         }
 
@@ -326,7 +407,40 @@ export class ChatService extends Disposable {
         return { text: text || 'No response generated', thoughts };
     }
 
-    private async _executeCodeFromResponse(code: string): Promise<void> {
+    private _syncLastModelMessageTrace(): void {
+        const currentMessages = this._messages$.getValue();
+        if (currentMessages.length === 0) return;
+        const lastMsg = currentMessages[currentMessages.length - 1];
+        if (lastMsg.role !== 'model') return;
+        lastMsg.trace = this._trace$.getValue().map((t) => t.message);
+        this._messages$.next([...currentMessages]);
+    }
+
+    private _extractLikelyA1Refs(text: string): string[] {
+        const matches = text.toUpperCase().match(/\b[A-Z]{1,3}\d{1,7}\b/g) ?? [];
+        const unique = Array.from(new Set(matches));
+        return unique.slice(0, 5);
+    }
+
+    private _readCellValueByA1(a1: string): string {
+        try {
+            const loc = a1ToRowCol(a1);
+            if (!loc) return '[invalid A1]';
+            const univerInstanceService = this._injector.get(IUniverInstanceService);
+            const workbook = univerInstanceService.getCurrentUnitOfType<Workbook>(UniverInstanceType.UNIVER_SHEET);
+            if (!workbook) return '[no workbook]';
+            const worksheet = workbook.getActiveSheet();
+            if (!worksheet) return '[no worksheet]';
+
+            const cell = worksheet.getCellMatrix().getValue(loc.row, loc.col);
+            if (!cell || cell.v === undefined || cell.v === null) return '';
+            return String(cell.v);
+        } catch {
+            return '[read failed]';
+        }
+    }
+
+    private async _executeCode(code: string): Promise<{ ok: boolean; error?: string }> {
         this._addTrace('code', code);
         this._addTrace('info', 'Executing code via UniscriptExecutionService...');
 
@@ -338,31 +452,95 @@ export class ChatService extends Disposable {
 
             const success = await executionService.execute(code);
             if (success) {
-                this._addTrace('info', '✅ Code executed successfully.');
-            } else {
-                let errorMsg = '❌ Code execution returned false.';
-                if (typeof executionService.getLastError === 'function') {
-                    const lastError = executionService.getLastError();
-                    if (lastError) {
-                        errorMsg += `\nError: ${lastError.message}`;
-                    }
-                }
-                this._addTrace('error', errorMsg);
+                return { ok: true };
             }
-        } catch (error) {
-            const errorMsg = `Execution error: ${error instanceof Error ? error.message : 'Unknown error'}`;
-            this._addTrace('error', errorMsg);
-        }
 
-        // Update the last message with final trace
-        const currentMessages = this._messages$.getValue();
-        if (currentMessages.length > 0) {
-            const lastMsg = currentMessages[currentMessages.length - 1];
-            if (lastMsg.role === 'model') {
-                lastMsg.trace = this._trace$.getValue().map((t) => t.message);
-                this._messages$.next([...currentMessages]);
+            let errorMsg = 'Code execution returned false.';
+            if (typeof executionService.getLastError === 'function') {
+                const lastError = executionService.getLastError();
+                if (lastError) {
+                    errorMsg += `\nError: ${lastError.message}`;
+                }
             }
+            return { ok: false, error: errorMsg };
+        } catch (error) {
+            return { ok: false, error: `Execution error: ${error instanceof Error ? error.message : 'Unknown error'}` };
         }
+    }
+
+    private async _executeWithAutoFix(initialCode: string, userRequest: string): Promise<void> {
+        let code = initialCode;
+
+        try {
+            for (let attempt = 0; attempt <= MAX_AUTO_FIX_ATTEMPTS; attempt++) {
+                const result = await this._executeCode(code);
+                if (result.ok) {
+                    this._addTrace('info', '✅ Code executed successfully.');
+
+                    this._invalidateSheetContextCache();
+                    const postContext = this._getSheetContext(true);
+                    this._addTrace('info', `Post-execution sheet context:\n${postContext}`);
+
+                    const refs = this._extractLikelyA1Refs(userRequest);
+                    for (const ref of refs) {
+                        this._addTrace('info', `Verify ${ref}: ${this._readCellValueByA1(ref)}`);
+                    }
+                    return;
+                }
+
+                this._addTrace('error', `❌ ${result.error ?? 'Unknown execution error'}`);
+                if (attempt >= MAX_AUTO_FIX_ATTEMPTS) {
+                    return;
+                }
+
+                this._invalidateSheetContextCache();
+                const currentContext = this._getSheetContext(true);
+                this._addTrace('info', `Auto-fix attempt ${attempt + 1}/${MAX_AUTO_FIX_ATTEMPTS}...`);
+
+                const fixPrompt = [
+                    'You previously generated JavaScript code for Univer and it failed.',
+                    'Fix the code. Return ONLY one ```javascript``` code block. No extra text.',
+                    '',
+                    '[USER REQUEST]',
+                    userRequest,
+                    '',
+                    '[CURRENT SHEET DATA]',
+                    currentContext,
+                    '',
+                    '[FAILED CODE]',
+                    '```javascript',
+                    code,
+                    '```',
+                    '',
+                    '[ERROR]',
+                    result.error ?? 'Unknown error',
+                    '',
+                    'Constraints:',
+                    '- Prefer fast operations (e.g. sheet.getDataRange().clear({ contentsOnly: true }) for clearing).',
+                    '- Do not allocate huge 2D arrays for full-sheet operations.',
+                ].join('\n');
+
+                const { text: fixResponse } = await this._callGeminiAPIWithContents(
+                    [{ role: 'user', parts: [{ text: fixPrompt }] }],
+                    'minimal'
+                );
+
+                const fixedCodeMatch = fixResponse.match(/```(?:javascript|js)?\n([\s\S]*?)```/);
+                if (!fixedCodeMatch) {
+                    this._addTrace('error', '❌ Auto-fix failed: model did not return a javascript code block.');
+                    return;
+                }
+
+                code = fixedCodeMatch[1].trim();
+                this._addTrace('info', 'Received fixed code from Gemini, retrying execution...');
+            }
+        } finally {
+            this._syncLastModelMessageTrace();
+        }
+    }
+
+    private async _executeCodeFromResponse(code: string): Promise<void> {
+        await this._executeWithAutoFix(code, '');
     }
 
     clearHistory(): void {
