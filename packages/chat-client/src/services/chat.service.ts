@@ -15,9 +15,14 @@
  */
 
 import type { Workbook } from '@univerjs/core';
-import { Disposable, ILogService, Inject, Injector, IUniverInstanceService, UniverInstanceType } from '@univerjs/core';
+import { Disposable, ICommandService, ILogService, Inject, Injector, IUniverInstanceService, UniverInstanceType } from '@univerjs/core';
+// eslint-disable-next-line univer/no-facade-imports-outside-facade
+import { FUniver } from '@univerjs/core/facade';
 import { IUniscriptExecutionService } from '@univerjs/uniscript';
 import { BehaviorSubject } from 'rxjs';
+// Ensure sheets-specific facade helpers exist (getActiveWorkbook, selections, formulas).
+// eslint-disable-next-line univer/no-facade-imports-outside-facade
+import '@univerjs/sheets/facade';
 
 declare const __GOOGLE_API_KEY__: string | undefined;
 
@@ -60,6 +65,8 @@ function a1ToRowCol(a1: string): { row: number; col: number } | undefined {
 export interface IChatMessage {
     role: 'user' | 'model';
     content: string;
+    code?: string;
+    recap?: string;
     trace?: string[];
 }
 
@@ -127,9 +134,21 @@ export class ChatService extends Disposable {
     private _sheetContextDirty = true;
     private _sheetContextCache: { key: string; text: string; updatedAt: number } | undefined;
 
+    private _clipboard: unknown[][] | undefined;
+    private readonly _activeCell$ = new BehaviorSubject<{ cellA1: string; rangeA1: string; display: string }>({
+        cellA1: '',
+        rangeA1: '',
+        display: '',
+    });
+
+    readonly activeCell$ = this._activeCell$.asObservable();
+
+    private _lastSheetRefreshAt = 0;
+
     constructor(
         @ILogService private readonly _logService: ILogService,
-        @Inject(Injector) private readonly _injector: Injector
+        @Inject(Injector) private readonly _injector: Injector,
+        @ICommandService private readonly _commandService: ICommandService
     ) {
         super();
 
@@ -143,7 +162,18 @@ export class ChatService extends Disposable {
         this.disposeWithMe(() => {
             this._messages$.complete();
             this._trace$.complete();
+            this._activeCell$.complete();
         });
+
+        // Keep lightweight sheet context + active cell cache fresh without polling.
+        this.disposeWithMe(
+            this._commandService.onCommandExecuted(() => {
+                this._invalidateSheetContextCache();
+                this._maybeRefreshActiveCell();
+            })
+        );
+
+        this._maybeRefreshActiveCell(true);
     }
 
     get messages(): IChatMessage[] {
@@ -172,6 +202,128 @@ export class ChatService extends Disposable {
 
     private _invalidateSheetContextCache(): void {
         this._sheetContextDirty = true;
+    }
+
+    private _getUniverAPI(): FUniver {
+        return FUniver.newAPI(this._injector);
+    }
+
+    private _maybeRefreshActiveCell(force = false): void {
+        const now = Date.now();
+        if (!force && now - this._lastSheetRefreshAt < 120) return;
+        this._lastSheetRefreshAt = now;
+
+        try {
+            const api = this._getUniverAPI() as any;
+            const workbook = api.getActiveWorkbook?.();
+            if (!workbook) {
+                this._activeCell$.next({ cellA1: '', rangeA1: '', display: '' });
+                return;
+            }
+
+            const activeCell = workbook.getActiveCell?.();
+            const activeRange = workbook.getActiveRange?.();
+            const cellA1 = activeCell?.getA1Notation?.() ?? '';
+            const rangeA1 = activeRange?.getA1Notation?.() ?? '';
+
+            const formula = activeCell?.getFormula?.() ?? '';
+            const value = activeCell?.getValue?.();
+            const display = formula || (value === undefined || value === null ? '' : String(value));
+
+            this._activeCell$.next({ cellA1, rangeA1, display });
+        } catch {
+            // Ignore facade errors if sheets isn't active yet.
+        }
+    }
+
+    setActiveCellDisplay(valueOrFormula: string): void {
+        const api = this._getUniverAPI() as any;
+        const workbook = api.getActiveWorkbook?.();
+        const sheet = workbook?.getActiveSheet?.();
+        if (!workbook || !sheet) return;
+
+        const activeCell = workbook.getActiveCell?.() || sheet.getRange?.('A1');
+        if (!activeCell) return;
+
+        if (valueOrFormula.trim().startsWith('=')) {
+            activeCell.setFormula?.(valueOrFormula.trim());
+        } else {
+            activeCell.setValue?.(valueOrFormula);
+        }
+
+        this._invalidateSheetContextCache();
+        this._maybeRefreshActiveCell(true);
+    }
+
+    moveActiveCell(deltaRow: number, deltaCol: number): void {
+        const api = this._getUniverAPI() as any;
+        const workbook = api.getActiveWorkbook?.();
+        const sheet = workbook?.getActiveSheet?.();
+        if (!workbook || !sheet) return;
+
+        const activeCell = workbook.getActiveCell?.();
+        if (!activeCell) return;
+
+        const row = activeCell.getRow?.() ?? 0;
+        const col = activeCell.getColumn?.() ?? 0;
+
+        const maxRows = sheet.getMaxRows?.() ?? 1;
+        const maxCols = sheet.getMaxColumns?.() ?? 1;
+
+        const nextRow = Math.max(0, Math.min(maxRows - 1, row + deltaRow));
+        const nextCol = Math.max(0, Math.min(maxCols - 1, col + deltaCol));
+
+        const next = sheet.getRange?.(nextRow, nextCol, 1, 1);
+        if (!next) return;
+
+        sheet.setActiveRange?.(next);
+        this._invalidateSheetContextCache();
+        this._maybeRefreshActiveCell(true);
+    }
+
+    copySelection(): void {
+        const api = this._getUniverAPI() as any;
+        const workbook = api.getActiveWorkbook?.();
+        if (!workbook) return;
+        const range = workbook.getActiveRange?.();
+        if (!range) return;
+        this._clipboard = range.getValues?.() ?? undefined;
+    }
+
+    cutSelection(): void {
+        const api = this._getUniverAPI() as any;
+        const workbook = api.getActiveWorkbook?.();
+        if (!workbook) return;
+        const range = workbook.getActiveRange?.();
+        if (!range) return;
+        this._clipboard = range.getValues?.() ?? undefined;
+        range.clear?.({ contentsOnly: true });
+        this._invalidateSheetContextCache();
+        this._maybeRefreshActiveCell(true);
+    }
+
+    pasteClipboard(): void {
+        if (!this._clipboard || this._clipboard.length === 0) return;
+
+        const api = this._getUniverAPI() as any;
+        const workbook = api.getActiveWorkbook?.();
+        const sheet = workbook?.getActiveSheet?.();
+        if (!workbook || !sheet) return;
+
+        const activeCell = workbook.getActiveCell?.();
+        if (!activeCell) return;
+
+        const startRow = activeCell.getRow?.() ?? 0;
+        const startCol = activeCell.getColumn?.() ?? 0;
+        const rows = this._clipboard.length;
+        const cols = Math.max(...this._clipboard.map((r) => (Array.isArray(r) ? r.length : 0)), 1);
+
+        const target = sheet.getRange?.(startRow, startCol, rows, cols);
+        if (!target) return;
+        target.setValues?.(this._clipboard as any);
+
+        this._invalidateSheetContextCache();
+        this._maybeRefreshActiveCell(true);
     }
 
     /**
@@ -326,19 +478,23 @@ export class ChatService extends Disposable {
 
             // Extract code
             const codeMatch = response.match(/```(?:javascript|js)?\n([\s\S]*?)```/);
+            const code = codeMatch?.[1]?.trim();
+            const recap = response.replace(/```(?:javascript|js)?\n[\s\S]*?```/g, '').trim();
 
             this._messages$.next([
                 ...this._messages$.getValue(),
                 {
                     role: 'model',
-                    content: response,
+                    content: recap || response,
+                    recap: recap || response,
+                    code,
                     trace: this._trace$.getValue().map((t) => t.message),
                 },
             ]);
 
             // Execute code if present
-            if (codeMatch) {
-                await this._executeWithAutoFix(codeMatch[1].trim(), text);
+            if (code) {
+                await this._executeWithAutoFix(code, text);
             } else {
                 this._addTrace('info', 'No code block found to execute.');
             }

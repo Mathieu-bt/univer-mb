@@ -24,6 +24,14 @@ export const ChatPanel = () => {
     const chatService = useDependency(ChatService);
     const [messages, setMessages] = useState<IChatMessage[]>([]);
     const [inputValue, setInputValue] = useState('');
+    const [sheetMode, setSheetMode] = useState(false);
+    const [activeCell, setActiveCell] = useState<{ cellA1: string; rangeA1: string; display: string }>({
+        cellA1: '',
+        rangeA1: '',
+        display: '',
+    });
+    const [cellDraft, setCellDraft] = useState('');
+    const [isEditingCell, setIsEditingCell] = useState(false);
     const [apiKey, setApiKey] = useState('');
     const [showSettings, setShowSettings] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
@@ -35,6 +43,16 @@ export const ChatPanel = () => {
         const sub = chatService.messages$.subscribe(setMessages);
         return () => sub.unsubscribe();
     }, [chatService]);
+
+    useEffect(() => {
+        const sub = chatService.activeCell$.subscribe((state) => {
+            setActiveCell(state);
+            if (!isEditingCell) {
+                setCellDraft(state.display);
+            }
+        });
+        return () => sub.unsubscribe();
+    }, [chatService, isEditingCell]);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -81,9 +99,103 @@ export const ChatPanel = () => {
         }
     };
 
+    const commitCellDraft = () => {
+        chatService.setActiveCellDisplay(cellDraft);
+        setIsEditingCell(false);
+    };
+
+    const cancelCellDraft = () => {
+        setCellDraft(activeCell.display);
+        setIsEditingCell(false);
+    };
+
+    useEffect(() => {
+        if (!sheetMode) return;
+
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (e.defaultPrevented) return;
+
+            const isShortcut = e.ctrlKey || e.metaKey;
+
+            if (isShortcut && e.key.toLowerCase() === 'c') {
+                e.preventDefault();
+                chatService.copySelection();
+                return;
+            }
+
+            if (isShortcut && e.key.toLowerCase() === 'x') {
+                e.preventDefault();
+                chatService.cutSelection();
+                return;
+            }
+
+            if (isShortcut && e.key.toLowerCase() === 'v') {
+                e.preventDefault();
+                chatService.pasteClipboard();
+                return;
+            }
+
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                commitCellDraft();
+                return;
+            }
+
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelCellDraft();
+                return;
+            }
+
+            if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                e.preventDefault();
+                if (isEditingCell && cellDraft !== activeCell.display) {
+                    commitCellDraft();
+                }
+
+                if (e.key === 'ArrowUp') chatService.moveActiveCell(-1, 0);
+                if (e.key === 'ArrowDown') chatService.moveActiveCell(1, 0);
+                if (e.key === 'ArrowLeft') chatService.moveActiveCell(0, -1);
+                if (e.key === 'ArrowRight') chatService.moveActiveCell(0, 1);
+                return;
+            }
+
+            if (e.key === 'Backspace') {
+                e.preventDefault();
+                setIsEditingCell(true);
+                setCellDraft((prev) => prev.slice(0, -1));
+                return;
+            }
+
+            if (e.key === 'Delete') {
+                e.preventDefault();
+                setIsEditingCell(true);
+                setCellDraft('');
+                return;
+            }
+
+            if (!isShortcut && !e.altKey && e.key.length === 1) {
+                e.preventDefault();
+                setIsEditingCell(true);
+                setCellDraft((prev) => prev + e.key);
+            }
+        };
+
+        window.addEventListener('keydown', onKeyDown, { capture: true });
+        return () => window.removeEventListener('keydown', onKeyDown, { capture: true } as any);
+    }, [activeCell.display, cellDraft, chatService, isEditingCell, sheetMode]);
+
     const handleClearHistory = () => {
         chatService.clearHistory();
     };
+
+    const lastRecap = (() => {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (msg.role === 'model') return msg.recap || msg.content;
+        }
+        return '';
+    })();
 
     const renderMessage = (msg: IChatMessage, index: number) => {
         const isModel = msg.role === 'model';
@@ -106,7 +218,35 @@ export const ChatPanel = () => {
                             `
                     )}
                 >
-                    {isModel ? renderContent(msg.content) : msg.content}
+                    {isModel
+                        ? (
+                            <div className="univer-space-y-2">
+                                <div className="univer-whitespace-pre-wrap">{msg.recap || msg.content}</div>
+                                {msg.code && (
+                                    <details>
+                                        <summary
+                                            className={`
+                                              univer-cursor-pointer univer-text-[10px] univer-font-bold univer-uppercase
+                                              univer-text-gray-500
+                                              hover:univer-text-blue-500
+                                            `}
+                                        >
+                                            Show generated code
+                                        </summary>
+                                        <pre
+                                            className={`
+                                              univer-my-2 univer-overflow-x-auto univer-rounded-md univer-border
+                                              univer-border-gray-700 univer-bg-gray-900 univer-p-3 univer-text-xs
+                                              univer-text-blue-300
+                                            `}
+                                        >
+                                            <code>{msg.code}</code>
+                                        </pre>
+                                    </details>
+                                )}
+                            </div>
+                        )
+                        : msg.content}
                 </div>
                 {isModel && msg.trace && msg.trace.length > 0 && (
                     <details className="univer-mt-1 univer-w-full">
@@ -147,26 +287,7 @@ export const ChatPanel = () => {
         );
     };
 
-    const renderContent = (content: string) => {
-        const parts = content.split(/(```[\s\S]*?```)/g);
-        return parts.map((part, i) => {
-            if (part.startsWith('```')) {
-                const code = part.replace(/```(?:javascript|js)?\n?/, '').replace(/```$/, '');
-                return (
-                    <pre
-                        key={i}
-                        className={`
-                          univer-my-3 univer-overflow-x-auto univer-rounded-md univer-border univer-border-gray-700
-                          univer-bg-gray-900 univer-p-3 univer-text-xs univer-text-blue-300
-                        `}
-                    >
-                        <code>{code}</code>
-                    </pre>
-                );
-            }
-            return <span key={i} className="univer-whitespace-pre-wrap">{part}</span>;
-        });
-    };
+    // Model responses are rendered as recap + optional code toggle (see renderMessage).
 
     return (
         <div
@@ -189,17 +310,109 @@ export const ChatPanel = () => {
                 >
                     AI Assistant
                 </span>
-                <button
-                    onClick={() => setShowSettings(!showSettings)}
-                    className={`
-                      univer-rounded univer-p-1 univer-transition-colors
-                      hover:univer-bg-gray-200
-                      dark:hover:univer-bg-gray-700
-                    `}
-                    title="Settings"
-                >
-                    ⚙️
-                </button>
+                <div className="univer-flex univer-items-center univer-gap-2">
+                    <button
+                        onClick={() => setSheetMode((v) => !v)}
+                        className={clsx(
+                            `
+                              univer-rounded univer-border univer-px-2 univer-py-1 univer-text-[10px] univer-font-bold
+                              univer-uppercase univer-transition-colors
+                              dark:univer-border-gray-700
+                            `,
+                            sheetMode
+                                ? 'univer-border-blue-600 univer-bg-blue-600 univer-text-white'
+                                : `
+                                  univer-border-gray-200 univer-bg-white univer-text-gray-600
+                                  dark:univer-bg-gray-900 dark:univer-text-gray-300
+                                `
+                        )}
+                        title="Sheet mode: arrows / Ctrl+C/X/V / typing apply to the sheet"
+                    >
+                        Sheet mode
+                    </button>
+                    <button
+                        onClick={() => setShowSettings(!showSettings)}
+                        className={`
+                          univer-rounded univer-p-1 univer-transition-colors
+                          hover:univer-bg-gray-200
+                          dark:hover:univer-bg-gray-700
+                        `}
+                        title="Settings"
+                    >
+                        ⚙️
+                    </button>
+                </div>
+            </div>
+
+            <div
+                className={`
+                  univer-space-y-2 univer-border-b univer-bg-gray-50 univer-p-3
+                  dark:univer-border-gray-700 dark:univer-bg-gray-800
+                `}
+            >
+                <div className="univer-flex univer-items-center univer-gap-2">
+                    <div
+                        className={`
+                          univer-min-w-14 univer-rounded univer-border univer-bg-white univer-px-2 univer-py-1
+                          univer-font-mono univer-text-[10px] univer-text-gray-700
+                          dark:univer-border-gray-700 dark:univer-bg-gray-900 dark:univer-text-gray-200
+                        `}
+                        title={activeCell.rangeA1 ? `Selection: ${activeCell.rangeA1}` : ''}
+                    >
+                        {activeCell.cellA1 || '—'}
+                    </div>
+                    <input
+                        value={cellDraft}
+                        onChange={(e) => {
+                            setIsEditingCell(true);
+                            setCellDraft(e.target.value);
+                        }}
+                        onFocus={() => setIsEditingCell(true)}
+                        onBlur={() => setIsEditingCell(false)}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                commitCellDraft();
+                            } else if (e.key === 'Escape') {
+                                e.preventDefault();
+                                cancelCellDraft();
+                            }
+                        }}
+                        placeholder="Type value or =FORMULA for active cell"
+                        className={`
+                          univer-flex-1 univer-rounded univer-border univer-bg-white univer-px-3 univer-py-2
+                          univer-text-xs univer-outline-none
+                          focus:univer-ring-2 focus:univer-ring-blue-500
+                          dark:univer-border-gray-700 dark:univer-bg-gray-900 dark:univer-text-white
+                        `}
+                    />
+                    <Button size="small" onClick={commitCellDraft}>Apply</Button>
+                </div>
+
+                {!!lastRecap && (
+                    <div
+                        className={`
+                          univer-rounded univer-border univer-bg-white univer-p-2 univer-text-[11px]
+                          univer-text-gray-600
+                          dark:univer-border-gray-700 dark:univer-bg-gray-900 dark:univer-text-gray-300
+                        `}
+                    >
+                        <div
+                            className={`
+                              univer-mb-1 univer-text-[10px] univer-font-bold univer-uppercase univer-text-gray-500
+                            `}
+                        >
+                            Last changes
+                        </div>
+                        <div className="univer-line-clamp-3 univer-whitespace-pre-wrap">{lastRecap}</div>
+                    </div>
+                )}
+
+                {sheetMode && (
+                    <div className="univer-text-[10px] univer-text-gray-500">
+                        Sheet mode is ON: arrows / typing / Ctrl+C/X/V apply to the sheet. Press Esc to cancel edits, Enter to apply.
+                    </div>
+                )}
             </div>
 
             {showSettings && (
@@ -345,8 +558,8 @@ export const ChatPanel = () => {
                         value={inputValue}
                         onChange={(e) => setInputValue(e.target.value)}
                         onKeyDown={handleKeyDown}
-                        placeholder="Type a request..."
-                        disabled={isLoading}
+                        placeholder={sheetMode ? 'Sheet mode is ON (toggle to chat)' : 'Type a request...'}
+                        disabled={isLoading || sheetMode}
                         className={`
                           univer-flex-1 univer-rounded-full univer-border univer-px-3 univer-py-2 univer-text-sm
                           univer-outline-none
@@ -357,7 +570,7 @@ export const ChatPanel = () => {
                     />
                     <button
                         onClick={handleSend}
-                        disabled={isLoading || !inputValue.trim()}
+                        disabled={isLoading || sheetMode || !inputValue.trim()}
                         className={`
                           univer-flex univer-h-9 univer-w-9 univer-items-center univer-justify-center
                           univer-rounded-full univer-bg-blue-600 univer-p-2 univer-text-white univer-transition-colors
